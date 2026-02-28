@@ -6,18 +6,24 @@ export default async function handler(req, res) {
   try {
     const body = req.body;
 
+    // поддержка JSON и form-data вебхуков Kommo
     const lead =
       body?.leads?.status?.[0] ||
-      body?.["leads[status][0]"];
+      body?.["leads[status][0]"] ||
+      {
+        id: body["leads[status][0][id]"],
+        status_id: body["leads[status][0][status_id]"],
+        last_modified: body["leads[status][0][last_modified]"],
+      };
 
-    if (!lead) {
+    if (!lead?.id) {
       console.log("⏭ Нет лида");
       return res.status(200).end("ok");
     }
 
-    const leadId = lead.id || lead["id"];
-    const statusId = String(lead.status_id || lead["status_id"]);
-    const lastModified = lead.last_modified || lead["last_modified"];
+    const leadId = lead.id;
+    const statusId = String(lead.status_id);
+    const lastModified = lead.last_modified;
 
     const LOST_STATUS_ID = process.env.LOST_STATUS_ID;
 
@@ -28,6 +34,7 @@ export default async function handler(req, res) {
       return res.status(200).end("ok");
     }
 
+    // защита от дублей вебхука
     const dedupeKey = `${leadId}_${lastModified}`;
     if (global.lastProcessed === dedupeKey) {
       console.log("⏭ Дубликат вебхука");
@@ -43,7 +50,7 @@ export default async function handler(req, res) {
       return res.status(200).end("ok");
     }
 
-    // Получаем переписку через Conversations API (работает с Salesbot WhatsApp)
+    // получаем переписку Salesbot WhatsApp через conversations API
     const conversationsRes = await fetch(
       `https://${subdomain}.kommo.com/api/v4/leads/${leadId}/conversations`,
       {
@@ -54,13 +61,20 @@ export default async function handler(req, res) {
       }
     );
 
+    const conversationsText = await conversationsRes.text();
+
     if (!conversationsRes.ok) {
-      const text = await conversationsRes.text();
-      console.log("❌ Ошибка conversations:", text);
+      console.log("❌ Ошибка conversations:", conversationsText);
       return res.status(200).end("ok");
     }
 
-    const conversations = await conversationsRes.json();
+    let conversations;
+    try {
+      conversations = JSON.parse(conversationsText);
+    } catch {
+      console.log("❌ Не JSON conversations:", conversationsText.slice(0, 200));
+      return res.status(200).end("ok");
+    }
 
     let messagesText = "";
 
@@ -77,6 +91,7 @@ export default async function handler(req, res) {
       return res.status(200).end("ok");
     }
 
+    // запрос к OpenAI
     const aiRes = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
@@ -85,14 +100,28 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         model: "gpt-4.1-mini",
-        input: `Ты аналитик отдела продаж. Определи причину отказа клиента по переписке.\n\nПереписка:\n${messagesText}`,
+        input: `Ты аналитик продаж. Определи причину отказа клиента по переписке.
+
+Переписка:
+${messagesText}`,
       }),
     });
 
-    const aiData = await aiRes.json();
-    const analysis =
-      aiData.output?.[0]?.content?.[0]?.text || "Не удалось определить причину";
+    const aiTextRaw = await aiRes.text();
 
+    let aiData;
+    try {
+      aiData = JSON.parse(aiTextRaw);
+    } catch {
+      console.log("❌ Не JSON OpenAI:", aiTextRaw.slice(0, 200));
+      return res.status(200).end("ok");
+    }
+
+    const analysis =
+      aiData.output?.[0]?.content?.[0]?.text ||
+      "Не удалось определить причину отказа";
+
+    // добавляем заметку в сделку
     const noteRes = await fetch(
       `https://${subdomain}.kommo.com/api/v4/leads/${leadId}/notes`,
       {
@@ -116,7 +145,7 @@ export default async function handler(req, res) {
       const text = await noteRes.text();
       console.log("❌ Ошибка добавления примечания:", text);
     } else {
-      console.log("✅ Анализ добавлен в сделку", leadId);
+      console.log(`✅ Анализ добавлен в сделку ${leadId}`);
     }
 
     return res.status(200).end("ok");
