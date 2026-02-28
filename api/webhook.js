@@ -1,6 +1,6 @@
 export default async function handler(req, res) {
   try {
-    const KOMMO_DOMAIN = process.env.KOMMO_DOMAIN; // только поддомен
+    const KOMMO_DOMAIN = process.env.KOMMO_DOMAIN;
     const KOMMO_TOKEN = process.env.KOMMO_LONG_TOKEN;
 
     if (req.method !== "POST") {
@@ -10,45 +10,59 @@ export default async function handler(req, res) {
     const leadId = req.body.lead_id;
 
     if (!leadId) {
-      console.log("⏭ Нет lead_id");
       return res.status(200).json({ message: "Нет lead_id" });
     }
 
-    console.log(`Lead ${leadId} — получаем чат`);
+    console.log(`Lead ${leadId}`);
 
-    // 1. Получаем связанные чаты сделки
-    const linksResp = await fetch(
-      `https://${KOMMO_DOMAIN}.kommo.com/api/v4/leads/${leadId}/links`,
+    // 1. Получаем контакт сделки
+    const leadResp = await fetch(
+      `https://${KOMMO_DOMAIN}.kommo.com/api/v4/leads/${leadId}?with=contacts`,
       {
         headers: {
           Authorization: `Bearer ${KOMMO_TOKEN}`,
-          "Content-Type": "application/json",
         },
       }
     );
 
-    const linksData = await linksResp.json();
+    const leadData = await leadResp.json();
 
-    const conversations = linksData?._embedded?.links?.filter(
-      (l) => l.to_entity_type === "conversations"
-    );
+    const contactId = leadData?._embedded?.contacts?.[0]?.id;
 
-    if (!conversations || conversations.length === 0) {
-      console.log("⏭ Чаты не найдены");
-      return res.status(200).json({ message: "Чаты не найдены" });
+    if (!contactId) {
+      console.log("⏭ Контакт не найден");
+      return res.status(200).json({ message: "Контакт не найден" });
     }
 
-    const conversationId = conversations[0].to_entity_id;
+    console.log(`Contact ${contactId}`);
 
-    console.log(`Conversation ${conversationId}`);
-
-    // 2. Получаем сообщения чата
-    const messagesResp = await fetch(
-      `https://${KOMMO_DOMAIN}.kommo.com/api/v4/conversations/${conversationId}/messages`,
+    // 2. Получаем чаты контакта
+    const chatsResp = await fetch(
+      `https://${KOMMO_DOMAIN}.kommo.com/api/v4/contacts/${contactId}/chats`,
       {
         headers: {
           Authorization: `Bearer ${KOMMO_TOKEN}`,
-          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    const chatsData = await chatsResp.json();
+
+    const chatId = chatsData?._embedded?.chats?.[0]?.id;
+
+    if (!chatId) {
+      console.log("⏭ Чат у контакта не найден");
+      return res.status(200).json({ message: "Чат у контакта не найден" });
+    }
+
+    console.log(`Chat ${chatId}`);
+
+    // 3. Получаем сообщения
+    const messagesResp = await fetch(
+      `https://${KOMMO_DOMAIN}.kommo.com/api/v4/chats/${chatId}/messages`,
+      {
+        headers: {
+          Authorization: `Bearer ${KOMMO_TOKEN}`,
         },
       }
     );
@@ -56,8 +70,9 @@ export default async function handler(req, res) {
     const messagesData = await messagesResp.json();
 
     const messages =
-      messagesData?._embedded?.messages?.map((m) => m.text).filter(Boolean) ||
-      [];
+      messagesData?._embedded?.messages
+        ?.map((m) => m.text)
+        .filter(Boolean) || [];
 
     if (messages.length === 0) {
       console.log("⏭ Сообщений нет");
@@ -67,10 +82,11 @@ export default async function handler(req, res) {
     const chatText = messages.join("\n");
 
     console.log("✅ Чат получен");
-    console.log(chatText);
 
     return res.status(200).json({
       lead_id: leadId,
+      contact_id: contactId,
+      chat_id: chatId,
       messages_count: messages.length,
       chat: chatText,
     });
