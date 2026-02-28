@@ -1,140 +1,81 @@
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).end();
-  }
-
   try {
-    const body = req.body;
+    const KOMMO_DOMAIN = process.env.KOMMO_DOMAIN; // только поддомен
+    const KOMMO_TOKEN = process.env.KOMMO_LONG_TOKEN;
 
-    // === универсальный парсинг webhook ===
-    const leadId =
-      body?.["leads[status][0][id]"] ??
-      body?.leads?.status?.[0]?.id;
-
-    const statusId =
-      body?.["leads[status][0][status_id]"] ??
-      body?.leads?.status?.[0]?.status_id;
-
-    const lastModified =
-      body?.["leads[status][0][last_modified]"] ??
-      body?.leads?.status?.[0]?.last_modified;
-
-    if (!leadId || !statusId) {
-      console.log("⏭ Нет лида");
-      return res.status(200).end();
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "Method not allowed" });
     }
 
-    console.log(`Lead ${leadId}, status ${statusId}`);
+    const leadId = req.body.lead_id;
 
-    const LOST_STATUS = String(process.env.KOMMO_LOST_STATUS_ID);
-
-    if (String(statusId) !== LOST_STATUS) {
-      console.log("⏭ Не проиграно");
-      return res.status(200).end();
+    if (!leadId) {
+      console.log("⏭ Нет lead_id");
+      return res.status(200).json({ message: "Нет lead_id" });
     }
 
-    // === дедупликация по last_modified ===
-    const dedupeKey = `${leadId}_${lastModified}`;
-    if (global.lastProcessed === dedupeKey) {
-      console.log("⏭ Дубликат события");
-      return res.status(200).end();
-    }
-    global.lastProcessed = dedupeKey;
+    console.log(`Lead ${leadId} — получаем чат`);
 
-    const domain = process.env.KOMMO_DOMAIN;
-    const token = process.env.KOMMO_LONG_TOKEN;
-
-    // === получаем переписку ===
-    let chatText = "";
-
-    try {
-      const linksRes = await fetch(
-        `https://${domain}.kommo.com/api/v4/leads/${leadId}/links`,
-        {
-          headers: { Authorization: `Bearer ${token}` },
-        }
-      );
-
-      const linksData = await linksRes.json();
-
-      const conversation = linksData?._embedded?.links?.find(
-        (l) => l.entity_type === "conversation"
-      );
-
-      if (conversation) {
-        const convId = conversation.to_entity_id;
-
-        const msgRes = await fetch(
-          `https://${domain}.kommo.com/api/v4/conversations/${convId}/messages`,
-          {
-            headers: { Authorization: `Bearer ${token}` },
-          }
-        );
-
-        const msgData = await msgRes.json();
-
-        chatText = msgData?._embedded?.messages
-          ?.map((m) => m.text)
-          .filter(Boolean)
-          .join("\n");
-      }
-    } catch (e) {
-      console.log("⏭ Ошибка получения чата");
-    }
-
-    if (!chatText) {
-      chatText = "Переписка отсутствует";
-    }
-
-    // === запрос к OpenAI ===
-    const aiRes = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-4.1-mini",
-        input: `Ты РОП. Проанализируй причину проигрыша сделки.
-
-Переписка:
-${chatText}
-
-Дай:
-1. Причину отказа
-2. Ошибки менеджера
-3. Что делать в следующий раз`,
-      }),
-    });
-
-    const aiData = await aiRes.json();
-
-    const aiText =
-      aiData?.output?.[0]?.content?.[0]?.text ??
-      "Не удалось получить анализ";
-
-    // === добавляем примечание ===
-    await fetch(`https://${domain}.kommo.com/api/v4/leads/${leadId}/notes`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify([
-        {
-          note_type: "common",
-          params: {
-            text: `AI-анализ причины отказа:\n\n${aiText}`,
-          },
+    // 1. Получаем связанные чаты сделки
+    const linksResp = await fetch(
+      `https://${KOMMO_DOMAIN}.kommo.com/api/v4/leads/${leadId}/links`,
+      {
+        headers: {
+          Authorization: `Bearer ${KOMMO_TOKEN}`,
+          "Content-Type": "application/json",
         },
-      ]),
+      }
+    );
+
+    const linksData = await linksResp.json();
+
+    const conversations = linksData?._embedded?.links?.filter(
+      (l) => l.to_entity_type === "conversations"
+    );
+
+    if (!conversations || conversations.length === 0) {
+      console.log("⏭ Чаты не найдены");
+      return res.status(200).json({ message: "Чаты не найдены" });
+    }
+
+    const conversationId = conversations[0].to_entity_id;
+
+    console.log(`Conversation ${conversationId}`);
+
+    // 2. Получаем сообщения чата
+    const messagesResp = await fetch(
+      `https://${KOMMO_DOMAIN}.kommo.com/api/v4/conversations/${conversationId}/messages`,
+      {
+        headers: {
+          Authorization: `Bearer ${KOMMO_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    const messagesData = await messagesResp.json();
+
+    const messages =
+      messagesData?._embedded?.messages?.map((m) => m.text).filter(Boolean) ||
+      [];
+
+    if (messages.length === 0) {
+      console.log("⏭ Сообщений нет");
+      return res.status(200).json({ message: "Сообщений нет" });
+    }
+
+    const chatText = messages.join("\n");
+
+    console.log("✅ Чат получен");
+    console.log(chatText);
+
+    return res.status(200).json({
+      lead_id: leadId,
+      messages_count: messages.length,
+      chat: chatText,
     });
-
-    console.log(`✅ Анализ добавлен в сделку ${leadId}`);
-
-    return res.status(200).end();
   } catch (e) {
-    console.error(e);
-    return res.status(200).end();
+    console.error("❌ Ошибка:", e);
+    return res.status(500).json({ error: "Ошибка получения чата" });
   }
 }
