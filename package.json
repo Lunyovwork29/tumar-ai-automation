@@ -1,0 +1,6 @@
+{
+  "name": "tumar-ai-automation",
+  "version": "1.0.0",
+  "description": "AI-анализ сделок Kommo CRM для Tumar Carpets",
+  "private": true
+}
