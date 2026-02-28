@@ -25,7 +25,7 @@ export default async function handler(req, res) {
     const statusId = String(lead.status_id);
     const lastModified = lead.last_modified;
 
-    const LOST_STATUS_ID = process.env.LOST_STATUS_ID;
+    const LOST_STATUS_ID = String(process.env.LOST_STATUS_ID);
 
     console.log(`Lead ${leadId}, status ${statusId}`);
 
