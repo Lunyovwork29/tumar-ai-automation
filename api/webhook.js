@@ -14,13 +14,22 @@ export default async function handler(req, res) {
 
     let leads = [];
 
-    // Глобальный вебхук Kommo
+    // Новый формат Kommo
     if (body?.leads?.status) {
       leads = body.leads.status;
     } else if (body?.leads?.add) {
       leads = body.leads.add;
     }
-    // Робот Kommo (HTTP запрос)
+    // Старый формат amoCRM / Kommo
+    else if (body['leads[status][0][id]']) {
+      leads = [
+        {
+          id: body['leads[status][0][id]'],
+          status_id: body['leads[status][0][status_id]'],
+        },
+      ];
+    }
+    // Если когда-нибудь появится робот с JSON
     else if (body?.lead_id) {
       leads = [
         {
