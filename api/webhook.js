@@ -15,9 +15,8 @@ export default async function handler(req, res) {
 
     console.log(`Lead ${leadId}`);
 
-    // 1. Получаем контакт сделки
-    const leadResp = await fetch(
-      `https://${KOMMO_DOMAIN}.kommo.com/api/v4/leads/${leadId}?with=contacts`,
+    const notesResp = await fetch(
+      `https://${KOMMO_DOMAIN}.kommo.com/api/v4/leads/${leadId}/notes?limit=250`,
       {
         headers: {
           Authorization: `Bearer ${KOMMO_TOKEN}`,
@@ -25,73 +24,29 @@ export default async function handler(req, res) {
       }
     );
 
-    const leadData = await leadResp.json();
-
-    const contactId = leadData?._embedded?.contacts?.[0]?.id;
-
-    if (!contactId) {
-      console.log("⏭ Контакт не найден");
-      return res.status(200).json({ message: "Контакт не найден" });
-    }
-
-    console.log(`Contact ${contactId}`);
-
-    // 2. Получаем чаты контакта
-    const chatsResp = await fetch(
-      `https://${KOMMO_DOMAIN}.kommo.com/api/v4/contacts/${contactId}/chats`,
-      {
-        headers: {
-          Authorization: `Bearer ${KOMMO_TOKEN}`,
-        },
-      }
-    );
-
-    const chatsData = await chatsResp.json();
-
-    const chatId = chatsData?._embedded?.chats?.[0]?.id;
-
-    if (!chatId) {
-      console.log("⏭ Чат у контакта не найден");
-      return res.status(200).json({ message: "Чат у контакта не найден" });
-    }
-
-    console.log(`Chat ${chatId}`);
-
-    // 3. Получаем сообщения
-    const messagesResp = await fetch(
-      `https://${KOMMO_DOMAIN}.kommo.com/api/v4/chats/${chatId}/messages`,
-      {
-        headers: {
-          Authorization: `Bearer ${KOMMO_TOKEN}`,
-        },
-      }
-    );
-
-    const messagesData = await messagesResp.json();
+    const notesData = await notesResp.json();
 
     const messages =
-      messagesData?._embedded?.messages
-        ?.map((m) => m.text)
+      notesData?._embedded?.notes
+        ?.map((n) => n.params?.text)
         .filter(Boolean) || [];
 
     if (messages.length === 0) {
-      console.log("⏭ Сообщений нет");
-      return res.status(200).json({ message: "Сообщений нет" });
+      console.log("⏭ Текстовых заметок нет");
+      return res.status(200).json({ message: "Текстовых заметок нет" });
     }
 
     const chatText = messages.join("\n");
 
-    console.log("✅ Чат получен");
+    console.log("✅ Текст заметок получен");
 
     return res.status(200).json({
       lead_id: leadId,
-      contact_id: contactId,
-      chat_id: chatId,
       messages_count: messages.length,
       chat: chatText,
     });
   } catch (e) {
     console.error("❌ Ошибка:", e);
-    return res.status(500).json({ error: "Ошибка получения чата" });
+    return res.status(500).json({ error: "Ошибка получения заметок" });
   }
 }
