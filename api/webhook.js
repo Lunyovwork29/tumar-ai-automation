@@ -13,13 +13,11 @@ export default async function handler(req, res) {
     const leadId = req.body["leads[status][0][id]"];
     const statusId = Number(req.body["leads[status][0][status_id]"]);
 
-    console.log(`Lead ${leadId}, status ${statusId}`);
-
     if (statusId !== LOST_STATUS_ID) {
-      console.log("⏭ Не статус проиграно");
       return res.status(200).end();
     }
 
+    // защита от дублей
     const existingNotes = await amoRequest(
       AMO_DOMAIN,
       AMO_TOKEN,
@@ -31,27 +29,39 @@ export default async function handler(req, res) {
     );
 
     if (alreadyAnalyzed) {
-      console.log("⏭ Анализ уже есть");
       return res.status(200).end();
     }
 
-    const links = await amoRequest(
+    // получаем контакт сделки
+    const lead = await amoRequest(
       AMO_DOMAIN,
       AMO_TOKEN,
-      `/api/v4/leads/${leadId}/links`
+      `/api/v4/leads/${leadId}?with=contacts`
     );
 
-    const chatLink = links?._embedded?.links?.find(
-      l => l.to_entity_type === "chats"
-    );
+    const contactId =
+      lead?._embedded?.contacts?.[0]?.id;
 
-    if (!chatLink) {
-      console.log("⏭ Нет чата");
+    if (!contactId) {
+      console.log("⏭ Нет контакта");
       return res.status(200).end();
     }
 
-    const chatId = chatLink.to_entity_id;
+    // получаем чаты контакта
+    const chats = await amoRequest(
+      AMO_DOMAIN,
+      AMO_TOKEN,
+      `/api/v4/contacts/${contactId}/chats`
+    );
 
+    const chatId = chats?._embedded?.chats?.[0]?.id;
+
+    if (!chatId) {
+      console.log("⏭ Нет чата у контакта");
+      return res.status(200).end();
+    }
+
+    // получаем сообщения
     const messages = await amoRequest(
       AMO_DOMAIN,
       AMO_TOKEN,
@@ -63,15 +73,9 @@ export default async function handler(req, res) {
       .join("\n");
 
     if (!chatText) {
-      console.log("⏭ Нет переписки — анализ пропущен");
+      console.log("⏭ Нет переписки");
       return res.status(200).end();
     }
-
-    const lead = await amoRequest(
-      AMO_DOMAIN,
-      AMO_TOKEN,
-      `/api/v4/leads/${leadId}`
-    );
 
     const context = `
 Сделка: ${lead.name}
@@ -90,9 +94,7 @@ ${chatText}
       "POST",
       {
         note_type: "common",
-        params: {
-          text: aiText
-        }
+        params: { text: aiText }
       }
     );
 
@@ -115,8 +117,14 @@ async function amoRequest(domain, token, path, method = "GET", body) {
     body: body ? JSON.stringify(body) : undefined
   });
 
-  if (res.status === 204) return {};
-  return res.json();
+  const text = await res.text();
+
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    console.error("❌ Не JSON:", text);
+    throw new Error("Kommo returned HTML");
+  }
 }
 
 async function analyze(context, key) {
@@ -131,7 +139,7 @@ async function analyze(context, key) {
       input: `
 Ты аналитик продаж.
 
-Проанализируй диалог менеджера с клиентом и данные сделки.
+Проанализируй диалог менеджера с клиентом.
 
 Напиши:
 
@@ -140,7 +148,7 @@ async function analyze(context, key) {
 Ошибки менеджера:
 Что делать иначе:
 
-Коротко и по делу.
+Коротко.
 
 ${context}
 `
