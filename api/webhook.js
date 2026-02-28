@@ -3,6 +3,9 @@ const KOMMO_TOKEN = process.env.KOMMO_LONG_TOKEN;
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const LOST_STATUS_ID = String(process.env.KOMMO_LOST_STATUS_ID);
 
+// защита от дублей
+const processedLeads = new Set();
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
@@ -14,44 +17,52 @@ export default async function handler(req, res) {
 
     let leads = [];
 
-    // Новый формат Kommo
     if (body?.leads?.status) {
       leads = body.leads.status;
-    }
-    // Старый формат amoCRM / Kommo
-    else if (body['leads[status][0][id]']) {
+    } else if (body['leads[status][0][id]']) {
       leads = [
         {
           id: body['leads[status][0][id]'],
           status_id: body['leads[status][0][status_id]'],
+          updated_at: body['leads[status][0][updated_at]'],
         },
       ];
     }
 
     if (!leads.length) {
-      console.log('❌ Не найдены сделки в payload');
       return res.status(200).json({ ok: true });
     }
 
     for (const lead of leads) {
       const leadId = lead.id;
       const statusId = String(lead.status_id);
+      const updatedAt = lead.updated_at || '';
+
+      const dedupeKey = `${leadId}_${updatedAt}`;
+
+      if (processedLeads.has(dedupeKey)) {
+        console.log('⏭ Дубль вебхука пропущен');
+        continue;
+      }
+
+      processedLeads.add(dedupeKey);
 
       console.log(`Lead ${leadId}, status: ${statusId}, expected lost: ${LOST_STATUS_ID}`);
 
       if (statusId !== LOST_STATUS_ID) {
-        console.log('⏭ Не статус "Проиграно"');
+        console.log('⏭ Не статус проиграно');
         continue;
       }
 
       const leadData = await getLeadData(leadId);
-      if (!leadData?.id) {
-        console.log('❌ Ошибка получения сделки из Kommo', leadData);
+      const notes = await getLeadNotes(leadId);
+
+      const context = buildContext(leadData, notes);
+
+      if (context.includes('Переписки нет')) {
+        console.log('⏭ Нет переписки — анализ пропущен');
         continue;
       }
-
-      const notes = await getLeadNotes(leadId);
-      const context = buildContext(leadData, notes);
 
       const analysis = await analyzeWithAI(context);
       await addNoteToLead(leadId, analysis);
@@ -68,7 +79,7 @@ export default async function handler(req, res) {
 
 async function getLeadData(leadId) {
   const response = await fetch(
-    `https://${KOMMO_DOMAIN}/api/v4/leads/${leadId}?with=contacts,pipeline`,
+    `https://${KOMMO_DOMAIN}/api/v4/leads/${leadId}?with=contacts`,
     {
       headers: {
         Authorization: `Bearer ${KOMMO_TOKEN}`,
@@ -77,18 +88,12 @@ async function getLeadData(leadId) {
     }
   );
 
-  const data = await response.json();
-
-  if (!response.ok) {
-    console.log('❌ Kommo getLeadData error:', data);
-  }
-
-  return data;
+  return response.json();
 }
 
 async function getLeadNotes(leadId) {
   const response = await fetch(
-    `https://${KOMMO_DOMAIN}/api/v4/leads/${leadId}/notes?limit=50`,
+    `https://${KOMMO_DOMAIN}/api/v4/leads/${leadId}/notes?limit=100`,
     {
       headers: {
         Authorization: `Bearer ${KOMMO_TOKEN}`,
@@ -98,15 +103,14 @@ async function getLeadNotes(leadId) {
   );
 
   const data = await response.json();
-
-  if (!response.ok) {
-    console.log('❌ Kommo getLeadNotes error:', data);
-  }
-
   return data?._embedded?.notes || [];
 }
 
 function extractNoteText(note) {
+  if (note.note_type !== 'message_in' && note.note_type !== 'message_out') {
+    return '';
+  }
+
   if (note?.params?.text) return note.params.text;
 
   if (note?.params?.message?.text) return note.params.message.text;
@@ -121,10 +125,6 @@ function extractNoteText(note) {
 function buildContext(lead, notes) {
   const budget = lead.price || 0;
   const name = lead.name || 'Без названия';
-  const createdAt = new Date(lead.created_at * 1000).toLocaleDateString('ru-RU');
-  const closedAt = lead.closed_at
-    ? new Date(lead.closed_at * 1000).toLocaleDateString('ru-RU')
-    : 'не указана';
 
   const fields = lead.custom_fields_values || [];
   const fieldMap = {};
@@ -132,33 +132,23 @@ function buildContext(lead, notes) {
     fieldMap[f.field_name] = f.values?.[0]?.value || '';
   }
 
-  const notesText =
-    notes
-      .filter(n =>
-        n.note_type === 'common' ||
-        n.note_type === 4 ||
-        n.note_type === 2 ||
-        n.note_type === 3
-      )
-      .map(n => {
-        const text = extractNoteText(n);
-        return text ? `- ${text}` : '';
-      })
-      .filter(Boolean)
-      .join('\n') || 'Переписки нет';
+  const chat = notes
+    .map(extractNoteText)
+    .filter(Boolean)
+    .join('\n');
+
+  if (!chat) {
+    return 'Переписки нет';
+  }
 
   return `
-Название сделки: ${name}
-Бюджет: ${budget} тенге
-Дата создания: ${createdAt}
-Дата закрытия: ${closedAt}
-Размер ковра: ${fieldMap['Размер ковра'] || 'не указан'}
-Класс ковра: ${fieldMap['Класс ковра'] || 'не указан'}
-Тип продажи: ${fieldMap['Тип продажи'] || 'не указан'}
+Сделка: ${name}
+Бюджет: ${budget}
 Город: ${fieldMap['Город'] || 'не указан'}
+Размер ковра: ${fieldMap['Размер ковра'] || 'не указан'}
 
-Переписка:
-${notesText}
+Переписка клиента и менеджера:
+${chat}
   `.trim();
 }
 
@@ -174,55 +164,45 @@ async function analyzeWithAI(context) {
       messages: [
         {
           role: 'system',
-          content: `Ты аналитик отдела продаж по премиальным коврам.
-Анализируй именно переписку: где клиент потерял интерес, какие ошибки допустил менеджер.
+          content: `Ты РОП. Анализируешь только переписку.
 
-Формат ответа:
-🔴 Причина отказа: ...
-💬 Что произошло в диалоге: ...
-💡 Конкретная рекомендация менеджеру: ...`,
+Игнорируй поля сделки.
+Определи:
+1. Где клиент потерял интерес
+2. Ошибку менеджера
+3. Конкретное действие для дожима
+
+Формат:
+🔴 Причина отказа:
+💬 Где сломалась коммуникация:
+💡 Что должен был сделать менеджер:`,
         },
         {
           role: 'user',
           content: context,
         },
       ],
-      max_tokens: 400,
-      temperature: 0.3,
+      temperature: 0.2,
+      max_tokens: 300,
     }),
   });
 
   const data = await response.json();
-
-  if (!response.ok) {
-    console.log('❌ OpenAI error:', data);
-    return '❌ Ошибка анализа OpenAI';
-  }
-
-  const text = data.choices?.[0]?.message?.content || 'Анализ недоступен';
-  return `🤖 AI-анализ причины отказа:\n\n${text}`;
+  return `🤖 AI-анализ:\n\n${data.choices?.[0]?.message?.content || 'Ошибка анализа'}`;
 }
 
 async function addNoteToLead(leadId, text) {
-  const response = await fetch(
-    `https://${KOMMO_DOMAIN}/api/v4/leads/${leadId}/notes`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${KOMMO_TOKEN}`,
-        'Content-Type': 'application/json',
+  await fetch(`https://${KOMMO_DOMAIN}/api/v4/leads/${leadId}/notes`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${KOMMO_TOKEN}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify([
+      {
+        note_type: 'common',
+        params: { text },
       },
-      body: JSON.stringify([
-        {
-          note_type: 'common',
-          params: { text },
-        },
-      ]),
-    }
-  );
-
-  if (!response.ok) {
-    const data = await response.json();
-    console.log('❌ Kommo addNote error:', data);
-  }
+    ]),
+  });
 }
