@@ -17,7 +17,7 @@ export default async function handler(req, res) {
     // Новый формат Kommo
     if (body?.leads?.status) {
       leads = body.leads.status;
-    } 
+    }
     // Старый формат amoCRM / Kommo
     else if (body['leads[status][0][id]']) {
       leads = [
@@ -106,6 +106,18 @@ async function getLeadNotes(leadId) {
   return data?._embedded?.notes || [];
 }
 
+function extractNoteText(note) {
+  if (note?.params?.text) return note.params.text;
+
+  if (note?.params?.message?.text) return note.params.message.text;
+
+  if (Array.isArray(note?.params?.message)) {
+    return note.params.message.map(m => m.text).filter(Boolean).join(' ');
+  }
+
+  return '';
+}
+
 function buildContext(lead, notes) {
   const budget = lead.price || 0;
   const name = lead.name || 'Без названия';
@@ -123,13 +135,17 @@ function buildContext(lead, notes) {
   const notesText =
     notes
       .filter(n =>
-        n.note_type === 'common' ||   // примечания
-        n.note_type === 4 ||          // системные
-        n.note_type === 2 ||          // входящие сообщения клиента
-        n.note_type === 3             // исходящие сообщения менеджера
+        n.note_type === 'common' ||
+        n.note_type === 4 ||
+        n.note_type === 2 ||
+        n.note_type === 3
       )
-      .map(n => `- ${n.params?.text || ''}`)
-      .join('\n') || 'Примечаний и переписки нет';
+      .map(n => {
+        const text = extractNoteText(n);
+        return text ? `- ${text}` : '';
+      })
+      .filter(Boolean)
+      .join('\n') || 'Переписки нет';
 
   return `
 Название сделки: ${name}
@@ -141,7 +157,7 @@ function buildContext(lead, notes) {
 Тип продажи: ${fieldMap['Тип продажи'] || 'не указан'}
 Город: ${fieldMap['Город'] || 'не указан'}
 
-Переписка и примечания:
+Переписка:
 ${notesText}
   `.trim();
 }
@@ -158,20 +174,20 @@ async function analyzeWithAI(context) {
       messages: [
         {
           role: 'system',
-          content: `Ты аналитик отдела продаж компании по продаже ручных ковров премиум-класса.
-Определи реальную причину отказа на основе переписки с клиентом и действий менеджера.
+          content: `Ты аналитик отдела продаж по премиальным коврам.
+Анализируй именно переписку: где клиент потерял интерес, какие ошибки допустил менеджер.
 
 Формат ответа:
 🔴 Причина отказа: ...
 💬 Что произошло в диалоге: ...
-💡 Рекомендация менеджеру: ...`,
+💡 Конкретная рекомендация менеджеру: ...`,
         },
         {
           role: 'user',
           content: context,
         },
       ],
-      max_tokens: 350,
+      max_tokens: 400,
       temperature: 0.3,
     }),
   });
