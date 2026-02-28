@@ -1,208 +1,142 @@
-const KOMMO_DOMAIN = process.env.KOMMO_DOMAIN;
-const KOMMO_TOKEN = process.env.KOMMO_LONG_TOKEN;
-const OPENAI_KEY = process.env.OPENAI_API_KEY;
-const LOST_STATUS_ID = String(process.env.KOMMO_LOST_STATUS_ID);
+import fetch from "node-fetch";
 
-// защита от дублей
-const processedLeads = new Set();
+const AMO_TOKEN = process.env.AMO_TOKEN;
+const AMO_DOMAIN = process.env.AMO_DOMAIN;
+const OPENAI_KEY = process.env.OPENAI_API_KEY;
+
+const LOST_STATUS_ID = 143;
 
 export default async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
   }
 
   try {
-    const body = req.body;
-    console.log('Webhook received:', JSON.stringify(body, null, 2));
+    const leadId = req.body["leads[status][0][id]"];
+    const statusId = Number(req.body["leads[status][0][status_id]"]);
+    const pipelineId = Number(req.body["leads[status][0][pipeline_id]"]);
 
-    let leads = [];
+    console.log(`Lead ${leadId}, status ${statusId}`);
 
-    if (body?.leads?.status) {
-      leads = body.leads.status;
-    } else if (body['leads[status][0][id]']) {
-      leads = [
-        {
-          id: body['leads[status][0][id]'],
-          status_id: body['leads[status][0][status_id]'],
-          updated_at: body['leads[status][0][updated_at]'],
-        },
-      ];
+    if (statusId !== LOST_STATUS_ID) {
+      console.log("⏭ Не статус проиграно");
+      return res.status(200).end();
     }
 
-    if (!leads.length) {
-      return res.status(200).json({ ok: true });
+    // Проверка на существующую AI-заметку
+    const existingNotes = await amoRequest(
+      `/api/v4/leads/${leadId}/notes`
+    );
+
+    const alreadyAnalyzed = existingNotes?._embedded?.notes?.some(n =>
+      n.params?.text?.includes("AI-анализ причины отказа")
+    );
+
+    if (alreadyAnalyzed) {
+      console.log("⏭ Анализ уже есть");
+      return res.status(200).end();
     }
 
-    for (const lead of leads) {
-      const leadId = lead.id;
-      const statusId = String(lead.status_id);
-      const updatedAt = lead.updated_at || '';
+    // Получаем chat_id через links
+    const links = await amoRequest(
+      `/api/v4/leads/${leadId}/links`
+    );
 
-      const dedupeKey = `${leadId}_${updatedAt}`;
+    const chatLink = links?._embedded?.links?.find(
+      l => l.to_entity_type === "chats"
+    );
 
-      if (processedLeads.has(dedupeKey)) {
-        console.log('⏭ Дубль вебхука пропущен');
-        continue;
+    if (!chatLink) {
+      console.log("⏭ Нет чата");
+      return res.status(200).end();
+    }
+
+    const chatId = chatLink.to_entity_id;
+
+    // Получаем сообщения чата
+    const messages = await amoRequest(
+      `/api/v4/chats/${chatId}/messages`
+    );
+
+    const chatText = messages?._embedded?.messages
+      ?.map(m => `${m.created_by === 0 ? "Клиент" : "Менеджер"}: ${m.text}`)
+      .join("\n");
+
+    if (!chatText) {
+      console.log("⏭ Нет переписки — анализ пропущен");
+      return res.status(200).end();
+    }
+
+    // Получаем данные сделки
+    const lead = await amoRequest(`/api/v4/leads/${leadId}`);
+
+    const context = `
+Сделка: ${lead.name}
+Бюджет: ${lead.price || "не указан"}
+Переписка:
+${chatText}
+`;
+
+    const aiText = await analyze(context);
+
+    await amoRequest(`/api/v4/leads/${leadId}/notes`, "POST", {
+      note_type: "common",
+      params: {
+        text: aiText
       }
+    });
 
-      processedLeads.add(dedupeKey);
+    console.log(`✅ Анализ добавлен в сделку ${leadId}`);
 
-      console.log(`Lead ${leadId}, status: ${statusId}, expected lost: ${LOST_STATUS_ID}`);
-
-      if (statusId !== LOST_STATUS_ID) {
-        console.log('⏭ Не статус проиграно');
-        continue;
-      }
-
-      const leadData = await getLeadData(leadId);
-      const notes = await getLeadNotes(leadId);
-
-      const context = buildContext(leadData, notes);
-
-      if (context.includes('Переписки нет')) {
-        console.log('⏭ Нет переписки — анализ пропущен');
-        continue;
-      }
-
-      const analysis = await analyzeWithAI(context);
-      await addNoteToLead(leadId, analysis);
-
-      console.log(`✅ Анализ добавлен в сделку ${leadId}`);
-    }
-
-    return res.status(200).json({ ok: true });
-  } catch (error) {
-    console.error('🔥 Общая ошибка:', error);
-    return res.status(500).json({ error: error.message });
+    return res.status(200).end();
+  } catch (e) {
+    console.error(e);
+    return res.status(500).end();
   }
 }
 
-async function getLeadData(leadId) {
-  const response = await fetch(
-    `https://${KOMMO_DOMAIN}/api/v4/leads/${leadId}?with=contacts`,
-    {
-      headers: {
-        Authorization: `Bearer ${KOMMO_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-    }
-  );
+async function amoRequest(path, method = "GET", body) {
+  const res = await fetch(`https://${AMO_DOMAIN}.kommo.com${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${AMO_TOKEN}`,
+      "Content-Type": "application/json"
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
 
-  return response.json();
+  if (res.status === 204) return {};
+
+  return res.json();
 }
 
-async function getLeadNotes(leadId) {
-  const response = await fetch(
-    `https://${KOMMO_DOMAIN}/api/v4/leads/${leadId}/notes?limit=100`,
-    {
-      headers: {
-        Authorization: `Bearer ${KOMMO_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-    }
-  );
-
-  const data = await response.json();
-  return data?._embedded?.notes || [];
-}
-
-function extractNoteText(note) {
-  if (note.note_type !== 'message_in' && note.note_type !== 'message_out') {
-    return '';
-  }
-
-  if (note?.params?.text) return note.params.text;
-
-  if (note?.params?.message?.text) return note.params.message.text;
-
-  if (Array.isArray(note?.params?.message)) {
-    return note.params.message.map(m => m.text).filter(Boolean).join(' ');
-  }
-
-  return '';
-}
-
-function buildContext(lead, notes) {
-  const budget = lead.price || 0;
-  const name = lead.name || 'Без названия';
-
-  const fields = lead.custom_fields_values || [];
-  const fieldMap = {};
-  for (const f of fields) {
-    fieldMap[f.field_name] = f.values?.[0]?.value || '';
-  }
-
-  const chat = notes
-    .map(extractNoteText)
-    .filter(Boolean)
-    .join('\n');
-
-  if (!chat) {
-    return 'Переписки нет';
-  }
-
-  return `
-Сделка: ${name}
-Бюджет: ${budget}
-Город: ${fieldMap['Город'] || 'не указан'}
-Размер ковра: ${fieldMap['Размер ковра'] || 'не указан'}
-
-Переписка клиента и менеджера:
-${chat}
-  `.trim();
-}
-
-async function analyzeWithAI(context) {
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
+async function analyze(context) {
+  const res = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
     headers: {
       Authorization: `Bearer ${OPENAI_KEY}`,
-      'Content-Type': 'application/json',
+      "Content-Type": "application/json"
     },
     body: JSON.stringify({
-      model: 'gpt-4o-mini',
-      messages: [
-        {
-          role: 'system',
-          content: `Ты РОП. Анализируешь только переписку.
+      model: "gpt-4.1-mini",
+      input: `
+Ты аналитик продаж.
 
-Игнорируй поля сделки.
-Определи:
-1. Где клиент потерял интерес
-2. Ошибку менеджера
-3. Конкретное действие для дожима
+Проанализируй переписку и данные сделки.
+Напиши:
 
-Формат:
-🔴 Причина отказа:
-💬 Где сломалась коммуникация:
-💡 Что должен был сделать менеджер:`,
-        },
-        {
-          role: 'user',
-          content: context,
-        },
-      ],
-      temperature: 0.2,
-      max_tokens: 300,
-    }),
+Причина отказа:
+Что произошло в диалоге:
+Ошибки менеджера:
+Что делать иначе:
+
+Коротко и по делу.
+
+${context}
+`
+    })
   });
 
-  const data = await response.json();
-  return `🤖 AI-анализ:\n\n${data.choices?.[0]?.message?.content || 'Ошибка анализа'}`;
-}
-
-async function addNoteToLead(leadId, text) {
-  await fetch(`https://${KOMMO_DOMAIN}/api/v4/leads/${leadId}/notes`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${KOMMO_TOKEN}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify([
-      {
-        note_type: 'common',
-        params: { text },
-      },
-    ]),
-  });
+  const data = await res.json();
+  return `AI-анализ причины отказа:\n\n${data.output_text}`;
 }
